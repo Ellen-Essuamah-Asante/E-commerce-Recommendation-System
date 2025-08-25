@@ -1,2 +1,7 @@
 Raw Data/
 *.csv
+
+# But don't ignore sampled datasets
+!events_sample.csv
+!item_properties_sample.csv
+!category_tree_sample.csv
