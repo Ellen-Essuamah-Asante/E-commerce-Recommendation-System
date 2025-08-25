@@ -10,128 +10,125 @@ st.title("🛒 Hybrid Recommendation System")
 st.write("Get personalized product recommendations using Collaborative + Content-Based filtering.")
 
 # =======================
-# File Uploaders
+# Load Data (from sampled CSVs)
 # =======================
-uploaded_events = st.file_uploader("Upload events_clean.csv", type=["csv"])
-uploaded_props = st.file_uploader(
-    "Upload item_properties_clean.csv", type=["csv"])
-uploaded_tree = st.file_uploader("Upload category_tree.csv", type=["csv"])
 
-if uploaded_events and uploaded_props and uploaded_tree:
-    # Load datasets
-    events = pd.read_csv(uploaded_events)
-    item_props = pd.read_csv(uploaded_props)
-    category_tree = pd.read_csv(uploaded_tree)
 
-    st.success("✅ All datasets uploaded successfully!")
-    st.write("Events preview:", events.head())
+@st.cache_data
+def load_data():
+    events = pd.read_csv("data/events_sample.csv")
+    item_props = pd.read_csv("data/item_properties_sample.csv")
+    category_tree = pd.read_csv("data/category_tree_sample.csv")
+    return events, item_props, category_tree
 
-    # =======================
-    # Preprocess Data
-    # =======================
-    weights = {"view": 1, "addtocart": 3, "transaction": 5}
-    events["event_strength"] = events["event"].map(weights)
-    events = events.dropna(subset=["visitorid", "itemid"])
 
-    user_item_strength = (
-        events.groupby(["visitorid", "itemid"])["event_strength"]
-        .sum()
-        .reset_index()
-    )
+events, item_props, category_tree = load_data()
+st.success("✅ Sampled data loaded successfully.")
+st.write("Events preview:", events.head())
 
-    # Create mapping
-    user_ids = user_item_strength["visitorid"].unique()
-    item_ids = user_item_strength["itemid"].unique()
-    user_mapping = {u: idx for idx, u in enumerate(user_ids)}
-    item_mapping = {i: idx for idx, i in enumerate(item_ids)}
-    inv_item_mapping = {v: k for k, v in item_mapping.items()}
+# =======================
+# Preprocess Data
+# =======================
+weights = {"view": 1, "addtocart": 3, "transaction": 5}
+events["event_strength"] = events["event"].map(weights)
+events = events.dropna(subset=["visitorid", "itemid"])
 
-    # Build interaction matrix
-    rows = user_item_strength["visitorid"].map(user_mapping)
-    cols = user_item_strength["itemid"].map(item_mapping)
-    values = user_item_strength["event_strength"]
-    X = csr_matrix((values, (rows, cols)), shape=(
-        len(user_ids), len(item_ids)))
+user_item_strength = (
+    events.groupby(["visitorid", "itemid"])["event_strength"]
+    .sum()
+    .reset_index()
+)
 
-    # =======================
-    # Collaborative Filtering (SVD)
-    # =======================
-    svd = TruncatedSVD(n_components=50, random_state=42)
-    user_factors = svd.fit_transform(X)
-    item_factors = svd.components_.T
+# Create mapping
+user_ids = user_item_strength["visitorid"].unique()
+item_ids = user_item_strength["itemid"].unique()
+user_mapping = {u: idx for idx, u in enumerate(user_ids)}
+item_mapping = {i: idx for idx, i in enumerate(item_ids)}
+inv_item_mapping = {v: k for k, v in item_mapping.items()}
 
-    # =======================
-    # Content-Based (TF-IDF)
-    # =======================
-    item_features = item_props.groupby("itemid")["num_value"] \
-        .apply(lambda x: " ".join(x.dropna().astype(str))) \
-        .reset_index()
+# Build interaction matrix
+rows = user_item_strength["visitorid"].map(user_mapping)
+cols = user_item_strength["itemid"].map(item_mapping)
+values = user_item_strength["event_strength"]
+X = csr_matrix((values, (rows, cols)), shape=(len(user_ids), len(item_ids)))
 
-    tfidf = TfidfVectorizer()
-    tfidf_matrix = tfidf.fit_transform(item_features["num_value"].astype(str))
+# =======================
+# Collaborative Filtering (SVD)
+# =======================
+svd = TruncatedSVD(n_components=50, random_state=42)
+user_factors = svd.fit_transform(X)
+item_factors = svd.components_.T
 
-    tfidf_item_ids = item_features["itemid"].tolist()
-    tfidf_item_mapping = {item_id: idx for idx,
-                          item_id in enumerate(tfidf_item_ids)}
+# =======================
+# Content-Based (TF-IDF)
+# =======================
+item_features = item_props.groupby("itemid")["num_value"] \
+    .apply(lambda x: " ".join(x.dropna().astype(str))) \
+    .reset_index()
 
-    knn = NearestNeighbors(
-        metric="cosine", algorithm="brute", n_neighbors=20, n_jobs=-1)
-    knn.fit(tfidf_matrix)
+tfidf = TfidfVectorizer()
+tfidf_matrix = tfidf.fit_transform(item_features["num_value"].astype(str))
 
-    # =======================
-    # Hybrid Recommendation Function
-    # =======================
-    def get_cb_scores(interacted_items_idx, num_items):
-        cb_scores = np.zeros(num_items)
-        for idx in interacted_items_idx:
-            item_id = inv_item_mapping[idx]
-            if item_id not in tfidf_item_mapping:
-                continue
-            tfidf_idx = tfidf_item_mapping[item_id]
+tfidf_item_ids = item_features["itemid"].tolist()
+tfidf_item_mapping = {item_id: idx for idx,
+                      item_id in enumerate(tfidf_item_ids)}
 
-            sims, indices = knn.kneighbors(
-                tfidf_matrix[tfidf_idx], n_neighbors=6, return_distance=True)
-            sims = 1 - sims.flatten()
+knn = NearestNeighbors(metric="cosine", algorithm="brute",
+                       n_neighbors=20, n_jobs=-1)
+knn.fit(tfidf_matrix)
 
-            for neigh_idx, sim in zip(indices.flatten(), sims):
-                neigh_item_id = tfidf_item_ids[neigh_idx]
-                if neigh_item_id in item_mapping:
-                    cf_idx = item_mapping[neigh_item_id]
-                    cb_scores[cf_idx] += sim
-        return cb_scores
+# =======================
+# Hybrid Recommendation Function
+# =======================
 
-    def hybrid_recommend(user_id, top_n=10, alpha=0.5):
-        if user_id not in user_mapping:
-            return ["Popular_" + str(i) for i in range(top_n)]
 
-        user_idx = user_mapping[user_id]
-        cf_scores = np.dot(user_factors[user_idx], item_factors.T)
+def get_cb_scores(interacted_items_idx, num_items):
+    cb_scores = np.zeros(num_items)
+    for idx in interacted_items_idx:
+        item_id = inv_item_mapping[idx]
+        if item_id not in tfidf_item_mapping:
+            continue
+        tfidf_idx = tfidf_item_mapping[item_id]
 
-        user_row = X.getrow(user_idx).toarray().ravel()
-        interacted_items_idx = np.where(user_row > 0)[0]
-        cb_scores = get_cb_scores(interacted_items_idx, item_factors.shape[0]) if len(
-            interacted_items_idx) > 0 else np.zeros(item_factors.shape[0])
+        sims, indices = knn.kneighbors(
+            tfidf_matrix[tfidf_idx], n_neighbors=6, return_distance=True
+        )
+        sims = 1 - sims.flatten()
 
-        hybrid_scores = alpha * cf_scores + (1 - alpha) * cb_scores
-        hybrid_scores[interacted_items_idx] = -np.inf
+        for neigh_idx, sim in zip(indices.flatten(), sims):
+            neigh_item_id = tfidf_item_ids[neigh_idx]
+            if neigh_item_id in item_mapping:
+                cf_idx = item_mapping[neigh_item_id]
+                cb_scores[cf_idx] += sim
+    return cb_scores
 
-        recommended_idx = np.argsort(-hybrid_scores)[:top_n]
-        return [inv_item_mapping[i] for i in recommended_idx]
 
-    # =======================
-    # Streamlit UI
-    # =======================
-    user_id = st.selectbox("Select User ID", user_ids)
-    alpha = st.slider(
-        "Weight for Collaborative Filtering (α)", 0.0, 1.0, 0.5, 0.1)
-    top_n = st.number_input("Number of Recommendations",
-                            min_value=1, max_value=20, value=5)
+def hybrid_recommend(user_id, top_n=10, alpha=0.5):
+    if user_id not in user_mapping:
+        return ["Popular_" + str(i) for i in range(top_n)]
 
-    if st.button("Get Recommendations"):
-        recs = hybrid_recommend(user_id, top_n=top_n, alpha=alpha)
-        st.subheader(f"Recommendations for User {user_id}")
-        for i, r in enumerate(recs, 1):
-            st.write(f"{i}. Item {r}")
+    user_idx = user_mapping[user_id]
+    cf_scores = np.dot(user_factors[user_idx], item_factors.T)
 
-else:
-    st.warning("⚠️ Please upload all 3 CSV files to continue.")
+    interacted_items = user_item_strength[user_item_strength["visitorid"] == user_id]["itemid"].map(
+        item_mapping)
+    cb_scores = get_cb_scores(interacted_items, len(item_ids))
+
+    final_scores = alpha * cf_scores + (1 - alpha) * cb_scores
+    top_items_idx = np.argsort(-final_scores)[:top_n]
+    return [inv_item_mapping[idx] for idx in top_items_idx]
+
+
+# =======================
+# Streamlit UI
+# =======================
+user_input = st.text_input("Enter User ID:", "")
+if user_input:
+    try:
+        user_id = int(user_input)
+        recs = hybrid_recommend(user_id, top_n=10, alpha=0.6)
+        st.write(f"### 🎯 Top Recommendations for User {user_id}")
+        for r in recs:
+            st.write(f"- Item {r}")
+    except ValueError:
+        st.error("⚠️ Please enter a valid numeric User ID")
